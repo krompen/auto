@@ -1,0 +1,535 @@
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    BusinessMessagesDeleted, LabeledPrice, PreCheckoutQuery, BusinessConnection
+)
+from aiogram.filters import CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.enums import ParseMode
+import aiosqlite
+
+BOT_TOKEN = "8809696078:AAG5G0SM6GSBhsom0SWZNztQAlOr-TgvzKk"
+ADMIN_ID = 8724732477
+CHANNEL_URL = "https://t.me/swithub"
+CHANNEL_ID = "@swithub"
+DB_NAME = "swithub_logger.db"
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# --- СОСТОЯНИЯ ---
+class AdminManage(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_custom_msg = State()
+
+# --- БАЗА ДАННЫХ ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                is_premium INTEGER DEFAULT 0,
+                is_banned INTEGER DEFAULT 0,
+                diamonds INTEGER DEFAULT 0,
+                refs INTEGER DEFAULT 0,
+                dnd_mode INTEGER DEFAULT 0,
+                anti_read INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS msg_cache (
+                msg_id TEXT PRIMARY KEY,
+                chat_id INTEGER,
+                sender_id INTEGER,
+                sender_name TEXT,
+                sender_username TEXT,
+                text TEXT,
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS connections (
+                conn_id TEXT PRIMARY KEY,
+                owner_id INTEGER
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS muted (
+                owner_id INTEGER,
+                target_id INTEGER,
+                PRIMARY KEY (owner_id, target_id)
+            )
+        """)
+        
+        # Обновление таблиц на случай старой базы
+        try: await db.execute("ALTER TABLE users ADD COLUMN dnd_mode INTEGER DEFAULT 0")
+        except: pass
+        try: await db.execute("ALTER TABLE users ADD COLUMN anti_read INTEGER DEFAULT 0")
+        except: pass
+        
+        await db.commit()
+
+async def cache_message(business_connection_id, msg: Message):
+    if not msg.text: return
+    msg_unique_id = f"{business_connection_id}_{msg.chat.id}_{msg.message_id}"
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO msg_cache (msg_id, chat_id, sender_id, sender_name, sender_username, text) VALUES (?, ?, ?, ?, ?, ?)",
+            (msg_unique_id, msg.chat.id, msg.from_user.id, msg.from_user.first_name, msg.from_user.username, msg.text)
+        )
+        await db.commit()
+
+# --- MIDDLEWARE (ПОДПИСКА И БАН) ---
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = event.message.from_user if event.message else (event.callback_query.from_user if event.callback_query else None)
+        
+        if event.business_message or event.deleted_business_messages or event.edited_business_message or event.business_connection:
+            return await handler(event, data)
+
+        if user:
+            async with aiosqlite.connect(DB_NAME) as db:
+                async with db.execute("SELECT is_banned FROM users WHERE user_id = ?", (user.id,)) as c:
+                    row = await c.fetchone()
+                    if row and row[0] == 1:
+                        if event.callback_query:
+                            await event.callback_query.answer("⛔️ Вы заблокированы.", show_alert=True)
+                        return 
+            
+            if user.id != ADMIN_ID:
+                try:
+                    member = await bot.get_chat_member(CHANNEL_ID, user.id)
+                    if member.status in ['left', 'kicked', 'banned']:
+                        text = "⚠️ <b>Обязательная подписка!</b>\n\nЯ не работаю, пока ты не подписан на канал проекта."
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="💬 Канал проекта", url=CHANNEL_URL)],
+                            [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]
+                        ])
+                        if event.message:
+                            await event.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+                        elif event.callback_query and event.callback_query.data != "check_sub":
+                            await event.callback_query.message.answer(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+                        return
+                except:
+                    pass
+        return await handler(event, data)
+
+dp.update.outer_middleware(AccessMiddleware())
+
+# --- КЛАВИАТУРЫ ---
+def start_kb(user_id: int):
+    kb = [
+        [InlineKeyboardButton(text="🎓 Возможности бота", callback_data="info_useful")],
+        [
+            InlineKeyboardButton(text="💬 Канал проекта", url=CHANNEL_URL),
+            InlineKeyboardButton(text="🛠 Гайд по подключению", callback_data="info_guide")
+        ],
+        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="my_profile")],
+        [
+            InlineKeyboardButton(text="🔓 Купить Премиум", callback_data="buy_premium"),
+            InlineKeyboardButton(text="💎 Партнерка", callback_data="affiliate")
+        ]
+    ]
+    if user_id == ADMIN_ID:
+        kb.append([InlineKeyboardButton(text="⚙️ Админ-панель", callback_data="adm_main")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="cancel_action")]
+    ])
+
+# --- ЛИЧКА С БОТОМ ---
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    ref_id = None
+    if " " in message.text:
+        potential_ref = message.text.split(" ")[1]
+        if potential_ref.isdigit(): ref_id = int(potential_ref)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (message.from_user.id,)) as cursor:
+            user_exists = await cursor.fetchone()
+            
+        if not user_exists:
+            await db.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (message.from_user.id, message.from_user.username))
+            if ref_id and ref_id != message.from_user.id:
+                await db.execute("UPDATE users SET diamonds = diamonds + 5, refs = refs + 1 WHERE user_id = ?", (ref_id,))
+                try: await bot.send_message(ref_id, "🎉 <b>Новый реферал!</b> Вам начислено <b>5 💎</b>.", parse_mode=ParseMode.HTML)
+                except: pass
+        await db.commit()
+    
+    text = (
+        f"👋 <b>Добро пожаловать, {message.from_user.first_name}</b>\n\n"
+        "<b>Swithub</b> - многофункциональный ассистент для твоих личных сообщений.\n\n"
+        "Чтобы бот начал ловить удаленки, сохранять исчезающие фото/видео и использовать автоответчик, "
+        "перейдите в <b>«Гайд по подключению»</b>."
+    )
+    await message.answer(text, reply_markup=start_kb(message.from_user.id), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(call: CallbackQuery):
+    member = await bot.get_chat_member(CHANNEL_ID, call.from_user.id)
+    if member.status not in ['left', 'kicked', 'banned']:
+        await call.message.delete()
+        await call.message.answer("✅ Подписка подтверждена! Напиши /start")
+    else:
+        await call.answer("❌ Ты еще не подписался!", show_alert=True)
+
+@dp.callback_query(F.data == "cancel_action")
+async def cb_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text = (
+        f"👋 <b>Добро пожаловать, {call.from_user.first_name}</b>\n\n"
+        "<b>Swithub</b> - многофункциональный ассистент для твоих личных сообщений."
+    )
+    await call.message.edit_text(text, reply_markup=start_kb(call.from_user.id), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "info_guide")
+async def cb_info_guide(call: CallbackQuery):
+    text = (
+        "🛠 <b>Как подключить Swithub?</b>\n\n"
+        "1. Зайди в настройки Telegram.\n"
+        "2. Перейди в раздел <b>Telegram Business -> Чат-боты</b>.\n"
+        "3. Впиши юзернейм нашего бота.\n"
+        "4. Выдай права на чтение и отправку сообщений.\n"
+        "5. Готово! Бот напишет тебе об успешном подключении."
+    )
+    await call.message.edit_text(text, reply_markup=cancel_kb(), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "info_useful")
+async def cb_info_useful(call: CallbackQuery):
+    text = (
+        "🎓 <b>Возможности Swithub:</b>\n\n"
+        "• <b>Сейвер медиа:</b> Автоматически перехватывает «исчезающие» фото, видео и кружочки, сохраняя их тебе в избранное.\n"
+        "• <b>Скрытое чтение:</b> Читай сообщения через бота, не оставляя синих галочек.\n"
+        "• <b>Логгер удаленок:</b> Фиксирует всё, что собеседник пытается удалить или изменить.\n"
+        "• <b>Шорткаты и Автоответы:</b> Режим сна (DND), заметки и быстрые шаблоны."
+    )
+    await call.message.edit_text(text, reply_markup=cancel_kb(), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "affiliate")
+async def cb_affiliate(call: CallbackQuery):
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={call.from_user.id}"
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT diamonds, refs FROM users WHERE user_id = ?", (call.from_user.id,)) as c:
+            row = await c.fetchone()
+            diamonds, refs = row if row else (0, 0)
+
+    text = (
+        "💎 <b>Партнерская программа</b>\n\n"
+        "Приглашай друзей и получай <b>5 💎</b> за каждого!\n"
+        f"👥 Твои рефералы: <b>{refs}</b>\n"
+        f"💎 Баланс: <b>{diamonds} алмазов</b>\n\n"
+        f"🔗 <b>Твоя ссылка:</b>\n<code>{ref_link}</code>"
+    )
+    await call.message.edit_text(text, reply_markup=cancel_kb(), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "my_profile")
+async def cb_profile(call: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT is_premium, diamonds, dnd_mode, anti_read FROM users WHERE user_id = ?", (call.from_user.id,)) as c:
+            row = await c.fetchone()
+            is_prem, diamonds, dnd, anti = row if row else (0, 0, 0, 0)
+
+    status = "💎 Активирован" if is_prem else "Отсутствует"
+    text = (
+        f"👤 <b>Ваш профиль:</b>\n\n"
+        f"🔑 ID: <code>{call.from_user.id}</code>\n"
+        f"💎 Баланс: <b>{diamonds} алмазов</b>\n"
+        f"🔓 Премиум: <b>{status}</b>\n\n"
+        f"⚙️ <b>Статус модулей:</b>\n"
+        f"🌙 Режим сна (DND): {'Вкл' if dnd else 'Выкл'}\n"
+        f"👁 Скрытое чтение: {'Вкл' if anti else 'Выкл'}"
+    )
+    await call.message.edit_text(text, reply_markup=cancel_kb(), parse_mode=ParseMode.HTML)
+
+# --- ПРЕМИУМ ---
+@dp.callback_query(F.data == "buy_premium")
+async def cb_buy_prem(call: CallbackQuery):
+    text = (
+        "🔓 <b>Премиум доступ Swithub</b>\n\n"
+        "• <b>75 звёзд ⭐️</b> — на 7 дней\n"
+        "• <b>50 алмазов 💎</b> — на 7 дней"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Купить за 75 ⭐️", callback_data="pay_75_stars")],
+        [InlineKeyboardButton(text="Обменять 50 💎", callback_data="pay_50_diamonds")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="cancel_action")]
+    ])
+    await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "pay_50_diamonds")
+async def process_buy_diamonds(call: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT diamonds FROM users WHERE user_id = ?", (call.from_user.id,)) as c:
+            row = await c.fetchone()
+            diamonds = row[0] if row else 0
+            
+        if diamonds >= 50:
+            await db.execute("UPDATE users SET diamonds = diamonds - 50, is_premium = 1 WHERE user_id = ?", (call.from_user.id,))
+            await db.commit()
+            await call.message.edit_text("✅ <b>Успешно!</b> Премиум активирован.", parse_mode=ParseMode.HTML, reply_markup=cancel_kb())
+        else:
+            await call.answer("❌ Недостаточно алмазов!", show_alert=True)
+
+@dp.callback_query(F.data == "pay_75_stars")
+async def process_buy_stars(call: CallbackQuery):
+    await bot.send_invoice(
+        chat_id=call.from_user.id,
+        title="Swithub Premium",
+        description="Полный доступ к модулям",
+        payload="prem_7_days",
+        provider_token="",
+        currency="XTR",
+        prices=[LabeledPrice(label="Premium", amount=75)]
+    )
+    await call.answer()
+
+@dp.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+@dp.message(F.successful_payment)
+async def successful_payment_handler(message: Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET is_premium = 1 WHERE user_id = ?", (message.from_user.id,))
+        await db.commit()
+    await message.answer("✅ <b>Оплата прошла успешно!</b>", parse_mode=ParseMode.HTML)
+
+# --- BUSINESS АССИСТЕНТ ---
+@dp.business_connection()
+async def handle_biz_connection(connection: BusinessConnection):
+    async with aiosqlite.connect(DB_NAME) as db:
+        if connection.is_enabled:
+            await db.execute("INSERT OR REPLACE INTO connections (conn_id, owner_id) VALUES (?, ?)", (connection.id, connection.user.id))
+            await bot.send_message(
+                connection.user.id, 
+                "✅ <b>Swithub подключен!</b>\nОтслеживание диалогов запущено. Введи <code>/help</code> в любом чате для списка команд.", 
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            await db.execute("DELETE FROM connections WHERE conn_id = ?", (connection.id,))
+        await db.commit()
+
+@dp.business_message()
+async def handle_new_business_message(message: Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT owner_id FROM connections WHERE conn_id = ?", (message.business_connection_id,)) as cursor:
+            owner_row = await cursor.fetchone()
+        if not owner_row: return
+        owner_id = owner_row[0]
+
+        async with db.execute("SELECT dnd_mode, anti_read FROM users WHERE user_id = ?", (owner_id,)) as cursor:
+            settings_row = await cursor.fetchone()
+            dnd_mode, anti_read = settings_row if settings_row else (0, 0)
+
+    # Кэшируем текст для отслеживания измененки
+    await cache_message(message.business_connection_id, message)
+
+    # --- КОМАНДЫ ВЛАДЕЛЬЦА ---
+    if message.from_user.id == owner_id and message.text:
+        target_id = message.chat.id
+        cmd = message.text.lower().strip()
+        
+        if cmd == "/help":
+            help_text = (
+                "🛠 <b>Модули Swithub:</b>\n\n"
+                "<code>/mute</code> — автоответчик-заглушка для собеседника\n"
+                "<code>/unmute</code> — снять заглушку\n"
+                "<code>/dnd</code> — вкл/выкл Режим Сна (ответ всем, что ты занят)\n"
+                "<code>/read</code> — вкл/выкл Скрытое чтение\n"
+                "<code>/note</code> — (реплай) сохранить сообщение собеседника в бота\n"
+                "<code>/price</code> — (шорткат) отправить прайс-лист"
+            )
+            await bot.send_message(target_id, help_text, business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+            
+        elif cmd == "/mute":
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("INSERT OR IGNORE INTO muted (owner_id, target_id) VALUES (?, ?)", (owner_id, target_id))
+                await db.commit()
+            await bot.send_message(target_id, "🔇 <b>Мут активирован.</b>", business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+            
+        elif cmd == "/unmute":
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("DELETE FROM muted WHERE owner_id = ? AND target_id = ?", (owner_id, target_id))
+                await db.commit()
+            await bot.send_message(target_id, "🔊 <b>Мут снят.</b>", business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+            
+        elif cmd == "/dnd":
+            new_state = 0 if dnd_mode else 1
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("UPDATE users SET dnd_mode = ? WHERE user_id = ?", (new_state, owner_id))
+                await db.commit()
+            status_text = "включен 🌙" if new_state else "выключен ☀️"
+            await bot.send_message(target_id, f"ℹ️ <b>Режим сна {status_text}.</b>", business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+
+        elif cmd == "/read":
+            new_state = 0 if anti_read else 1
+            async with aiosqlite.connect(DB_NAME) as db:
+                await db.execute("UPDATE users SET anti_read = ? WHERE user_id = ?", (new_state, owner_id))
+                await db.commit()
+            status_text = "включено 👁" if new_state else "выключено ❌"
+            await bot.send_message(target_id, f"ℹ️ <b>Скрытое чтение {status_text}.</b>", business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+
+        elif cmd == "/note" and message.reply_to_message:
+            # Сохранение заметки в личку с ботом
+            try:
+                await bot.copy_message(chat_id=owner_id, from_chat_id=target_id, message_id=message.reply_to_message.message_id)
+                await bot.send_message(target_id, "✅ <i>Успешно сохранено в заметки (ЛС с ботом).</i>", business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+            except: pass
+
+        elif cmd == "/price":
+            # Шорткат прайс-листа
+            price_text = "💼 <b>Прайс-лист на услуги:</b>\n\n• Базовый тариф — 1000₽\n• Премиум разработка — 5000₽\n• Консультация — 500₽\n\n<i>Для заказа ответьте на это сообщение.</i>"
+            await bot.send_message(target_id, price_text, business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+    
+    # --- СООБЩЕНИЯ ОТ СОБЕСЕДНИКА ---
+    elif message.from_user.id != owner_id:
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT 1 FROM muted WHERE owner_id = ? AND target_id = ?", (owner_id, message.chat.id)) as cursor:
+                is_muted = await cursor.fetchone()
+
+        # 1. Сейвер Медиа (Кружочки, Видео, Фото)
+        if message.photo or message.video or message.video_note or message.voice:
+            sender_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+            try:
+                await bot.send_message(owner_id, f"📥 <b>Перехват медиа от {sender_name}:</b>", parse_mode=ParseMode.HTML)
+                await bot.copy_message(chat_id=owner_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            except: pass
+
+        # 2. Скрытое чтение
+        if anti_read and message.text:
+            sender_name = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+            try:
+                await bot.send_message(owner_id, f"👁 <b>{sender_name} пишет:</b>\n\n{message.text}", parse_mode=ParseMode.HTML)
+            except: pass
+
+        # 3. Мут (Автоответчик без удаления)
+        if is_muted:
+            try: await bot.send_message(message.chat.id, "🚫 <i>Пользователь ограничил получение сообщений.</i>", business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+            except: pass
+            
+        # 4. Режим сна (DND)
+        elif dnd_mode:
+            try: await bot.send_message(message.chat.id, "🌙 <i>Пользователь сейчас отдыхает. Сообщение доставлено, ответ будет позже.</i>", business_connection_id=message.business_connection_id, parse_mode=ParseMode.HTML)
+            except: pass
+
+@dp.edited_business_message()
+async def handle_edited_business_message(message: Message):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT owner_id FROM connections WHERE conn_id = ?", (message.business_connection_id,)) as cursor:
+            owner_row = await cursor.fetchone()
+        if not owner_row: return
+        owner_id = owner_row[0]
+
+    msg_unique_id = f"{message.business_connection_id}_{message.chat.id}_{message.message_id}"
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT text FROM msg_cache WHERE msg_id = ?", (msg_unique_id,)) as cursor:
+            row = await cursor.fetchone()
+            old_text = row[0] if row else "<i>[Текст не был сохранен]</i>"
+            
+    username = f"@{message.from_user.username}" if message.from_user.username else message.from_user.first_name
+    log_text = (
+        f"✏️ <b>Изменено сообщение от {username}</b>\n\n"
+        f"<b>Было:</b> {old_text}\n"
+        f"<b>Стало:</b> {message.text}"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="В чат", url=f"tg://resolve?domain={message.chat.username}")]]) if message.chat.username else None
+    try: await bot.send_message(owner_id, log_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    except: pass
+    await cache_message(message.business_connection_id, message)
+
+@dp.deleted_business_messages()
+async def handle_deleted_business_messages(deleted: BusinessMessagesDeleted):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT owner_id FROM connections WHERE conn_id = ?", (deleted.business_connection_id,)) as cursor:
+            owner_row = await cursor.fetchone()
+        if not owner_row: return
+        owner_id = owner_row[0]
+
+    for msg_id in deleted.message_ids:
+        msg_unique_id = f"{deleted.business_connection_id}_{deleted.chat.id}_{msg_id}"
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT sender_name, sender_username, text FROM msg_cache WHERE msg_id = ?", (msg_unique_id,)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    sender_name, sender_username, text = row
+                    username_str = f"@{sender_username}" if sender_username else sender_name
+                    log_text = (
+                        f"🗑 <b>Удалено сообщение от {username_str}</b>\n\n"
+                        f"<b>Текст:</b> {text}"
+                    )
+                    try: await bot.send_message(owner_id, log_text, parse_mode=ParseMode.HTML)
+                    except: pass
+
+# --- АДМИН ПАНЕЛЬ ---
+def admin_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🔙 Закрыть", callback_data="cancel_action")]
+    ])
+
+@dp.callback_query(F.data == "adm_main", F.from_user.id == ADMIN_ID)
+async def cb_adm_main(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("⚙️ <b>Панель управления Swithub:</b>", reply_markup=admin_main_kb(), parse_mode=ParseMode.HTML)
+
+@dp.callback_query(F.data == "adm_stats", F.from_user.id == ADMIN_ID)
+async def cb_adm_stats(call: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as c1: total_users = (await c1.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE is_premium = 1") as c2: prem_users = (await c2.fetchone())[0]
+            
+    await call.message.edit_text(
+        f"📊 <b>Статистика:</b>\n👥 Юзеров: {total_users}\n💎 Премиум: {prem_users}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]]), 
+        parse_mode=ParseMode.HTML
+    )
+
+@dp.callback_query(F.data == "adm_broadcast", F.from_user.id == ADMIN_ID)
+async def cb_adm_broadcast(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminManage.waiting_for_broadcast)
+    await call.message.edit_text("📢 Отправьте сообщение для рассылки всем пользователям:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_main")]]))
+
+@dp.message(StateFilter(AdminManage.waiting_for_broadcast), F.from_user.id == ADMIN_ID)
+async def process_broadcast(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cursor:
+            users = await cursor.fetchall()
+
+    status = await message.answer(f"⏳ Рассылка запущена (получателей: {len(users)})...")
+    success, failed = 0, 0
+    
+    for (uid,) in users:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await status.edit_text(
+        f"📢 <b>Рассылка завершена:</b>\n\n✅ Успешно: <b>{success}</b>\n❌ Ошибок: <b>{failed}</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 В админку", callback_data="adm_main")]]),
+        parse_mode=ParseMode.HTML
+    )
+    await state.clear()
+
+async def main():
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
