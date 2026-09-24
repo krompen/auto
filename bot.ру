@@ -1,0 +1,401 @@
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, F, BaseMiddleware
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton, Update
+)
+from aiogram.filters import CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+import aiosqlite
+
+BOT_TOKEN = "8989551756:AAHLhaGlQ-chF3NG4EeGcuwOl5ih1CT7GcE"
+ADMIN_ID = 8724732477
+DB_NAME = "bot_database.db"
+DEANON_PASSWORD = "1488"
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# --- FSM (Состояния диалога) ---
+class UserStates(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_anon_question = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_reply = State()
+    waiting_for_broadcast = State()
+    waiting_for_password = State()
+
+# --- База данных ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                is_banned INTEGER DEFAULT 0,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS messages_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                is_anon INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Попытка добавить колонку is_banned, если база старая
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+        except aiosqlite.OperationalError:
+            pass 
+        await db.commit()
+
+async def add_user(user_id: int, username: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
+            (user_id, username or "отсутствует")
+        )
+        await db.commit()
+
+async def log_message(user_id: int, is_anon: int = 0):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("INSERT INTO messages_log (user_id, is_anon) VALUES (?, ?)", (user_id, is_anon))
+        await db.commit()
+
+async def set_user_ban(user_id: int, status: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET is_banned = ? WHERE user_id = ?", (status, user_id))
+        await db.commit()
+
+# --- Middleware для проверки блокировки ---
+class BanCheckMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: Update, data: dict):
+        user = event.message.from_user if event.message else (event.callback_query.from_user if event.callback_query else None)
+        if not user or user.id == ADMIN_ID:
+            return await handler(event, data)
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT is_banned FROM users WHERE user_id = ?", (user.id,)) as cursor:
+                row = await cursor.fetchone()
+                if row and row[0] == 1:
+                    if event.callback_query:
+                        await event.callback_query.answer("⛔️ Вы заблокированы в этом боте.", show_alert=True)
+                    return # Игнорируем заблокированного
+        return await handler(event, data)
+
+dp.update.outer_middleware(BanCheckMiddleware())
+
+# --- Клавиатуры ---
+def main_menu_kb(user_id: int):
+    kb = [
+        [
+            InlineKeyboardButton(text="📨 Написать админу", callback_data="btn_write"),
+            InlineKeyboardButton(text="🎭 Анонимный вопрос", callback_data="btn_anon")
+        ],
+        [
+            InlineKeyboardButton(text="👤 Мой профиль", callback_data="btn_profile"),
+            InlineKeyboardButton(text="📌 FAQ / Инфо", callback_data="btn_faq")
+        ]
+    ]
+    if user_id == ADMIN_ID:
+        kb.append([InlineKeyboardButton(text="🛡 Админ-панель", callback_data="btn_admin")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def faq_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤝 Сотрудничество / Реклама", callback_data="faq_collab")],
+        [InlineKeyboardButton(text="⏱ Сколько ждать ответа?", callback_data="faq_wait")],
+        [InlineKeyboardButton(text="🔙 В главное меню", callback_data="btn_back")]
+    ])
+
+def admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm_stats")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🔙 Выход", callback_data="btn_back")]
+    ])
+
+def cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Отмена / Назад", callback_data="btn_cancel_action")]
+    ])
+
+# Клавиатура для обычного сообщения (для админа)
+def admin_msg_kb(user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{user_id}")],
+        [InlineKeyboardButton(text="⛔️ Заблокировать", callback_data=f"ban_{user_id}")]
+    ])
+
+# Клавиатура для анонимного сообщения (для админа)
+def admin_anon_kb(user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить анониму", callback_data=f"reply_{user_id}")],
+        [InlineKeyboardButton(text="🔐 Узнать автора", callback_data=f"deanon_{user_id}")]
+    ])
+
+# --- Пользовательская часть ---
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await add_user(message.from_user.id, message.from_user.username)
+    text = (
+        f"👋 <b>Добро пожаловать, {message.from_user.first_name}!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Этот бот создан для связи со мной. Если у вас <b>спамблок</b> или вы хотите задать вопрос инкогнито — используйте меню ниже 🔽"
+    )
+    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
+
+@dp.callback_query(F.data == "btn_back")
+async def cb_back(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("💠 <b>ГЛАВНОЕ МЕНЮ</b> 💠\n━━━━━━━━━━━━━━━━━━━━\nВыберите нужное действие:", reply_markup=main_menu_kb(call.from_user.id), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "btn_cancel_action")
+async def cb_cancel_action(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.delete()
+    await call.message.answer("❌ <i>Действие отменено.</i>\n\n💠 <b>ГЛАВНОЕ МЕНЮ</b> 💠", reply_markup=main_menu_kb(call.from_user.id), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "btn_profile")
+async def cb_profile(call: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM messages_log WHERE user_id = ?", (call.from_user.id,)) as cursor:
+            count = (await cursor.fetchone())[0]
+
+    profile_text = (
+        "👤 <b>ВАШ ПРОФИЛЬ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔑 <b>ID:</b> <code>{call.from_user.id}</code>\n"
+        f"📝 <b>Юзернейм:</b> @{call.from_user.username or 'отсутствует'}\n"
+        f"📈 <b>Отправлено тикетов:</b> {count}\n"
+    )
+    await call.message.edit_text(profile_text, reply_markup=cancel_kb(), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "btn_faq")
+async def cb_faq(call: CallbackQuery):
+    await call.message.edit_text("📌 <b>ИНФОРМАЦИЯ И ЧАСТЫЕ ВОПРОСЫ</b>\n━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:", reply_markup=faq_kb(), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "faq_collab")
+async def cb_faq_collab(call: CallbackQuery):
+    await call.message.edit_text("🤝 <b>По поводу сотрудничества:</b>\n\nСразу пишите суть предложения, условия и ссылки одним сообщением через раздел «Написать админу».", reply_markup=faq_kb(), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "faq_wait")
+async def cb_faq_wait(call: CallbackQuery):
+    await call.message.edit_text("⏱ <b>Время ответа:</b>\n\nОтвечаю по мере свободного времени. Спам ускорит только вашу блокировку.", reply_markup=faq_kb(), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "btn_write")
+async def cb_write(call: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.waiting_for_message)
+    await call.message.answer("📨 <b>Напишите ваше сообщение:</b>\n<i>(Можно отправить текст, фото, видео или файл)</i>", reply_markup=cancel_kb(), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "btn_anon")
+async def cb_anon(call: CallbackQuery, state: FSMContext):
+    await state.set_state(UserStates.waiting_for_anon_question)
+    await call.message.answer("🎭 <b>Напишите анонимный вопрос:</b>\n<i>(Администратор не увидит ваш профиль и ID, пока не введет спец. пароль)</i>", reply_markup=cancel_kb(), parse_mode="HTML")
+    await call.answer()
+
+# --- Прием сообщений от пользователей ---
+@dp.message(StateFilter(UserStates.waiting_for_message))
+async def process_user_msg(message: Message, state: FSMContext):
+    await log_message(message.from_user.id, is_anon=0)
+    header = (
+        f"🔔 <b>НОВОЕ ОБРАЩЕНИЕ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 От: @{message.from_user.username or 'отсутствует'}\n"
+        f"🔑 ID: <code>{message.from_user.id}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <i>Сообщение ниже:</i>"
+    )
+    await bot.send_message(ADMIN_ID, header, parse_mode="HTML")
+    await bot.copy_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id, reply_markup=admin_msg_kb(message.from_user.id))
+    await message.answer("✅ <b>Успешно!</b> Сообщение доставлено администратору.", reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
+    await state.clear()
+
+@dp.message(StateFilter(UserStates.waiting_for_anon_question))
+async def process_anon_msg(message: Message, state: FSMContext):
+    await log_message(message.from_user.id, is_anon=1)
+    header = (
+        f"🎭 <b>АНОНИМНЫЙ ВОПРОС</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>Личность пользователя скрыта системой.</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👇 <i>Сообщение ниже:</i>"
+    )
+    await bot.send_message(ADMIN_ID, header, parse_mode="HTML")
+    await bot.copy_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id, reply_markup=admin_anon_kb(message.from_user.id))
+    await message.answer("✅ <b>Успешно!</b> Ваш вопрос отправлен полностью анонимно.", reply_markup=main_menu_kb(message.from_user.id), parse_mode="HTML")
+    await state.clear()
+
+# --- Функционал Администратора ---
+@dp.callback_query(F.data == "btn_admin", F.from_user.id == ADMIN_ID)
+async def cb_admin_panel(call: CallbackQuery):
+    await call.message.edit_text("🛡 <b>ПАНЕЛЬ АДМИНИСТРАТОРА</b>\n━━━━━━━━━━━━━━━━━━━━", reply_markup=admin_kb(), parse_mode="HTML")
+    await call.answer()
+
+@dp.callback_query(F.data == "adm_stats", F.from_user.id == ADMIN_ID)
+async def cb_admin_stats(call: CallbackQuery):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as c1:
+            total_users = (await c1.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM messages_log") as c2:
+            total_msgs = (await c2.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1") as c3:
+            total_banned = (await c3.fetchone())[0]
+
+    stats_text = (
+        "📊 <b>СТАТИСТИКА БОТА</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Пользователей: <b>{total_users}</b>\n"
+        f"✉️ Сообщений: <b>{total_msgs}</b>\n"
+        f"⛔️ В бане: <b>{total_banned}</b>"
+    )
+    await call.message.edit_text(stats_text, reply_markup=admin_kb(), parse_mode="HTML")
+    await call.answer()
+
+# Ответ пользователю
+@dp.callback_query(F.data.startswith("reply_"), F.from_user.id == ADMIN_ID)
+async def cb_reply_start(call: CallbackQuery, state: FSMContext):
+    target_id = int(call.data.split("_")[1])
+    await state.update_data(reply_target=target_id)
+    await state.set_state(AdminStates.waiting_for_reply)
+    
+    # Визуальное оформление ответа в зависимости от того, знаем мы ID или это аноним
+    await call.message.answer(
+        f"💬 <b>Режим ответа</b>\nВведите сообщение, которое будет отправлено пользователю:", 
+        parse_mode="HTML", reply_markup=cancel_kb()
+    )
+    await call.answer()
+
+@dp.message(StateFilter(AdminStates.waiting_for_reply), F.from_user.id == ADMIN_ID)
+async def process_reply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    target_id = data["reply_target"]
+    try:
+        await bot.send_message(target_id, "🔔 <b>Ответ от администратора:</b>", parse_mode="HTML")
+        await bot.copy_message(chat_id=target_id, from_chat_id=message.chat.id, message_id=message.message_id)
+        
+        # Более красивое подтверждение
+        await message.answer(
+            f"✅ <b>Сообщение успешно доставлено!</b>\n"
+            f"<i>Кому:</i> <code>{target_id}</code>\n", 
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.answer(f"❌ <b>Ошибка отправки:</b>\nПользователь заблокировал бота или удалил аккаунт.\n<i>Лог: {e}</i>", parse_mode="HTML")
+    await state.clear()
+
+# Блокировка / Разблокировка
+@dp.callback_query(F.data.startswith("ban_"), F.from_user.id == ADMIN_ID)
+async def cb_ban_user(call: CallbackQuery):
+    target_id = int(call.data.split("_")[1])
+    await set_user_ban(target_id, 1)
+    
+    # Меняем кнопку на разбан
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Разблокировать", callback_data=f"unban_{target_id}")]
+    ])
+    await call.message.edit_reply_markup(reply_markup=kb)
+    await call.answer(f"Пользователь {target_id} ЗАБЛОКИРОВАН!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("unban_"), F.from_user.id == ADMIN_ID)
+async def cb_unban_user(call: CallbackQuery):
+    target_id = int(call.data.split("_")[1])
+    await set_user_ban(target_id, 0)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{target_id}")],
+        [InlineKeyboardButton(text="⛔️ Заблокировать", callback_data=f"ban_{target_id}")]
+    ])
+    await call.message.edit_reply_markup(reply_markup=kb)
+    await call.answer(f"Пользователь {target_id} РАЗБЛОКИРОВАН!", show_alert=True)
+
+# Деанон анонима (Запрос пароля)
+@dp.callback_query(F.data.startswith("deanon_"), F.from_user.id == ADMIN_ID)
+async def cb_deanon_request(call: CallbackQuery, state: FSMContext):
+    target_id = int(call.data.split("_")[1])
+    await state.update_data(deanon_target=target_id, deanon_msg_id=call.message.message_id)
+    await state.set_state(AdminStates.waiting_for_password)
+    await call.message.answer("🔐 <b>Требуется авторизация</b>\nВведите 4-значный PIN-код для раскрытия личности:", parse_mode="HTML", reply_markup=cancel_kb())
+    await call.answer()
+
+# Проверка пароля на деанон
+@dp.message(StateFilter(AdminStates.waiting_for_password), F.from_user.id == ADMIN_ID)
+async def process_deanon_password(message: Message, state: FSMContext):
+    if message.text == DEANON_PASSWORD:
+        data = await state.get_data()
+        target_id = data["deanon_target"]
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            async with db.execute("SELECT username FROM users WHERE user_id = ?", (target_id,)) as cursor:
+                row = await cursor.fetchone()
+                username = row[0] if row else "неизвестно"
+
+        success_text = (
+            f"🔓 <b>ЛИЧНОСТЬ РАСКРЫТА</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>ID:</b> <code>{target_id}</code>\n"
+            f"👤 <b>Юзернейм:</b> @{username}"
+        )
+        await message.answer(success_text, parse_mode="HTML")
+        await state.clear()
+    else:
+        await message.answer("❌ <b>Неверный пароль.</b> Доступ запрещен.", parse_mode="HTML")
+        await state.clear()
+
+# Рассылка
+@dp.callback_query(F.data == "adm_broadcast", F.from_user.id == ADMIN_ID)
+async def cb_broadcast(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await call.message.answer("📢 <b>Режим рассылки</b>\nОтправьте сообщение (с фото/видео), которое получат ВСЕ пользователи бота:", reply_markup=cancel_kb(), parse_mode="HTML")
+    await call.answer()
+
+@dp.message(StateFilter(AdminStates.waiting_for_broadcast), F.from_user.id == ADMIN_ID)
+async def process_broadcast(message: Message, state: FSMContext):
+    async with aiosqlite.connect(DB_NAME) as db:
+        # Не рассылаем заблокированным
+        async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cursor:
+            users = await cursor.fetchall()
+
+    status = await message.answer(f"⏳ <i>Рассылка запущена... (Получателей: {len(users)})</i>", parse_mode="HTML")
+    success, failed = 0, 0
+
+    for (uid,) in users:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await status.edit_text(
+        f"📢 <b>Рассылка успешно завершена!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Доставлено: <b>{success}</b>\n"
+        f"❌ Ошибок: <b>{failed}</b>",
+        parse_mode="HTML"
+    )
+    await state.clear()
+
+# --- Точка входа ---
+async def main():
+    await init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
