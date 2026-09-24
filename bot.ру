@@ -1,0 +1,754 @@
+```python
+import asyncio
+import datetime
+import logging
+import os
+import random
+import re
+import sqlite3
+import sys
+from typing import List, Optional, Tuple
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("SwithubBot")
+
+# Конфигурация проекта Swithub
+BOT_TOKEN = "8595895020:AAFL-NEnwa83eoh2vaMZUvG7zRdHWlIcoOA"
+ADMIN_ID = 8724732477
+CHANNEL_USERNAME = "swithub"  # @swithub без знака @
+CHANNEL_URL = f"https://t.me/{CHANNEL_USERNAME}"
+DB_PATH = "swithub.db"
+
+# Лимиты для бесплатных пользователей
+FREE_DAILY_LIMIT = 5
+
+def init_db():
+    """Создание таблиц базы данных при первом запуске"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        # Таблица пользователей
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                vip_until INTEGER DEFAULT 0,
+                daily_searches INTEGER DEFAULT 0,
+                last_search_date TEXT DEFAULT '',
+                created_at INTEGER
+            )
+        """)
+        # Таблица ловушек (автомониторинг юзернеймов)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS traps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                created_at INTEGER,
+                is_active INTEGER DEFAULT 1
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+def get_user_db(user_id: int, username: str = "", first_name: str = ""):
+    """Получение или регистрация пользователя"""
+    now_ts = int(datetime.datetime.now().timestamp())
+    today_str = datetime.date.today().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, username, first_name, vip_until, daily_searches, last_search_date FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute(
+                "INSERT INTO users (user_id, username, first_name, vip_until, daily_searches, last_search_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (user_id, username, first_name, 0, 0, today_str, now_ts)
+            )
+            conn.commit()
+            return {"user_id": user_id, "username": username, "first_name": first_name, "vip_until": 0, "daily_searches": 0, "last_search_date": today_str}
+        
+        # Сброс дневного счетчика при смене даты
+        vip_until = row[3]
+        daily_searches = row[4]
+        last_date = row[5]
+        if last_date != today_str:
+            daily_searches = 0
+            cursor.execute("UPDATE users SET daily_searches = 0, last_search_date = ? WHERE user_id = ?", (today_str, user_id))
+            conn.commit()
+            
+        return {
+            "user_id": row[0],
+            "username": row[1],
+            "first_name": row[2],
+            "vip_until": vip_until,
+            "daily_searches": daily_searches,
+            "last_search_date": today_str,
+        }
+
+def is_vip(user_data: dict) -> bool:
+    """Проверка активности VIP-статуса"""
+    if user_data["user_id"] == ADMIN_ID:
+        return True
+    return user_data["vip_until"] > int(datetime.datetime.now().timestamp())
+
+def increment_search_count(user_id: int):
+    """Инкремент счетчика поисков пользователя"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE users SET daily_searches = daily_searches + 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+class SearchStates(StatesGroup):
+    waiting_for_mask = State()
+    waiting_for_trap_username = State()
+    admin_grant_vip = State()
+    admin_revoke_vip = State()
+    admin_broadcast = State()
+
+router = Router()
+
+def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Главная кнопочная панель Swithub"""
+    buttons = [
+        [
+            InlineKeyboardButton(text="⚡ Поиск 5-буквенных (Free)", callback_data="btn_quick_search"),
+            InlineKeyboardButton(text="🎯 Поиск по маске (VIP)", callback_data="btn_mask_search"),
+        ],
+        [
+            InlineKeyboardButton(text="🪤 Мои Ловушки", callback_data="btn_traps"),
+            InlineKeyboardButton(text="💎 VIP Статус", callback_data="btn_vip_info"),
+        ],
+        [
+            InlineKeyboardButton(text="👤 Мой Профиль", callback_data="btn_profile"),
+            InlineKeyboardButton(text="📢 Наш Канал", url=CHANNEL_URL),
+        ],
+    ]
+    if user_id == ADMIN_ID:
+        buttons.append([
+            InlineKeyboardButton(text="⚙️ Панель Администратора", callback_data="btn_admin_panel")
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_back_button() -> InlineKeyboardMarkup:
+    """Кнопка возврата в меню"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="btn_menu")]
+    ])
+
+def get_sub_check_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура проверки обязательной подписки"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на Swithub", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="🔄 Я подписался, проверить", callback_data="btn_check_sub")],
+    ])
+
+def get_admin_keyboard() -> InlineKeyboardMarkup:
+    """Панель управления администратора"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика проекта", callback_data="btn_admin_stats")],
+        [InlineKeyboardButton(text="👥 Список пользователей", callback_data="btn_admin_users")],
+        [
+            InlineKeyboardButton(text="➕ Выдать VIP", callback_data="btn_admin_add_vip"),
+            InlineKeyboardButton(text="➖ Снять VIP", callback_data="btn_admin_del_vip"),
+        ],
+        [InlineKeyboardButton(text="📨 Рассылка всем", callback_data="btn_admin_broadcast")],
+        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="btn_menu")],
+    ])
+
+async def check_user_subscription(bot: Bot, user_id: int) -> bool:
+    """Проверка подписки пользователя на канал"""
+    if user_id == ADMIN_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=f"@{CHANNEL_USERNAME}", user_id=user_id)
+        if member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"Ошибка проверки подписки: {e}. Проверьте, добавлен ли бот в канал @{CHANNEL_USERNAME}.")
+        # Если бот не админ в канале, не блокируем пользователя полностью
+        return True
+
+VOWELS = ["a", "e", "i", "o", "u"]
+CONSONANTS = ["b", "c", "d", "f", "g", "h", "k", "l", "m", "n", "p", "r", "s", "t", "v", "w", "z"]
+
+def generate_readable_5letter() -> str:
+    """Генерация читаемых пятибуквенных слов без цифр"""
+    # Схемы: CVCVC (напр. batel, moris), CVCCV (danto), VCCVC (alvin)
+    pattern = random.choice(["CVCVC", "CVCVC", "CVCCV", "VCCVC", "VCVCV"])
+    word = []
+    for char in pattern:
+        if char == "C":
+            word.append(random.choice(CONSONANTS))
+        else:
+            word.append(random.choice(VOWELS))
+    return "".join(word)
+
+def generate_by_mask(mask: str) -> Optional[str]:
+    """Генерация 5-буквенного логина по маске (например: a?b?c)"""
+    mask = mask.lower().strip()
+    if len(mask) != 5:
+        return None
+    res = []
+    for ch in mask:
+        if ch in ("?", "*", "_"):
+            res.append(random.choice(CONSONANTS + VOWELS))
+        elif ch.isalpha():
+            res.append(ch)
+        else:
+            return None
+    return "".join(res)
+
+async def check_telegram_username_available(session: aiohttp.ClientSession, username: str) -> bool:
+    """Проверка доступности имени пользователя через публичные страницы Telegram"""
+    url = f"https://t.me/{username}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as response:
+            if response.status == 200:
+                html = await response.text()
+                # Признаки занятого юзернейма на t.me:
+                # 1. Присутствует кнопка "Send Message" / "View in Telegram"
+                # 2. Наличие мета-тега robot или og:title
+                # 3. Отсутствие блока "tgme_page_action" с прямым переходом говорит о свободной странице
+                if 'class="tgme_action_button_new' in html or 'tgme_page_action' in html:
+                    # Дополнительно проверяем, если это страница пользователя или канала
+                    if 'tgme_page_photo' in html or 'tgme_page_title' in html:
+                        return False
+                
+                # Если страница существует, но не имеет профиля/описания/действия:
+                if 'If you have <strong>Telegram</strong>, you can contact' not in html:
+                    return True
+                return False
+            elif response.status == 404:
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка проверки юзернейма {username}: {e}")
+        return False
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, bot: Bot, state: FSMContext):
+    """Стартовое приветствие и проверка подписки"""
+    await state.clear()
+    user = get_user_db(message.from_user.id, message.from_user.username or "", message.from_user.first_name)
+    
+    # Проверка подписки
+    is_subbed = await check_user_subscription(bot, message.from_user.id)
+    if not is_subbed:
+        await message.answer(
+            f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
+            f"Для доступа к боту <b>Swithub</b> необходимо подписаться на наш официальный канал:\n"
+            f"👉 <b>@{CHANNEL_USERNAME}</b>\n\n"
+            f"После подписки нажмите кнопку проверки ниже:",
+            reply_markup=get_sub_check_keyboard(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    text = (
+        f"👋 Добро пожаловать в <b>Swithub Hunter</b>!\n\n"
+        f"🚀 Бот предназначен для мгновенного поиска <b>свободных 5-буквенных</b> читаемых юзернеймов в Telegram без цифр.\n\n"
+        f"⚡ <b>Бесплатный режим:</b> до {FREE_DAILY_LIMIT} проверок в сутки\n"
+        f"💎 <b>VIP-доступ:</b> безлимитный поиск, ловушки на юзернеймы и поиск по маске (а?б?в)\n\n"
+        f"Выберите нужное действие в меню ниже:"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard(message.from_user.id), parse_mode=ParseMode.HTML)
+
+@router.callback_query(F.data == "btn_check_sub")
+async def callback_check_subscription(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    """Повторная проверка подписки по кнопке"""
+    is_subbed = await check_user_subscription(bot, callback.from_user.id)
+    if is_subbed:
+        await callback.answer("✅ Подписка подтверждена!", show_alert=True)
+        await callback.message.edit_text(
+            "🎉 <b>Добро пожаловать в Swithub!</b>\n\nГлавное меню доступно ниже:",
+            reply_markup=get_main_keyboard(callback.from_user.id),
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await callback.answer("❌ Вы пока не подписались на канал @swithub!", show_alert=True)
+
+@router.callback_query(F.data == "btn_menu")
+async def callback_main_menu(callback: CallbackQuery, state: FSMContext):
+    """Возврат в главное меню"""
+    await state.clear()
+    await callback.message.edit_text(
+        "🎛 <b>Главное меню Swithub</b>\n\nВыберите необходимый инструмент:",
+        reply_markup=get_main_keyboard(callback.from_user.id),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "btn_profile")
+async def callback_profile(callback: CallbackQuery):
+    """Отображение личного профиля и лимитов"""
+    user = get_user_db(callback.from_user.id)
+    user_vip = is_vip(user)
+    
+    if user_vip:
+        if callback.from_user.id == ADMIN_ID:
+            vip_status_text = "👑 <b>Владелец (Swithub Dev)</b>"
+        else:
+            exp_date = datetime.datetime.fromtimestamp(user["vip_until"]).strftime("%d.%m.%Y %H:%M")
+            vip_status_text = f"💎 <b>VIP активен до:</b> {exp_date}"
+        limit_text = "♾️ <b>Безлимитно</b>"
+    else:
+        vip_status_text = "🔘 <b>Обычный пользователь</b>"
+        left_searches = max(0, FREE_DAILY_LIMIT - user["daily_searches"])
+        limit_text = f"{left_searches} из {FREE_DAILY_LIMIT} на сегодня"
+
+    text = (
+        f"👤 <b>Личный кабинет Swithub:</b>\n\n"
+        f"🆔 <b>ID:</b> <code>{callback.from_user.id}</code>\n"
+        f"⭐️ <b>Статус:</b> {vip_status_text}\n"
+        f"🔍 <b>Поисков осталось:</b> {limit_text}\n"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton(text="💎 Приобрести VIP", callback_data="btn_vip_info")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="btn_menu")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data == "btn_vip_info")
+async def callback_vip_info(callback: CallbackQuery):
+    """Информация о возможностях VIP"""
+    text = (
+        "💎 <b>Преимущества Swithub VIP:</b>\n\n"
+        "• <b>Безлимитный поиск</b> редких 5-буквенных юзернеймов\n"
+        "• <b>Поиск по маске:</b> например <code>s?a?r</code>, <code>?o?o?</code>\n"
+        "• <b>Ловушки (Снайпер юзернеймов):</b> бот автоматически мониторит занятые имена и пришлет вам уведомление, как только юзернейм освободится!\n"
+        "• <b>Приоритетная скорость</b> сканирования\n\n"
+        "📞 Для подключения напишите владельцу: <a href=\"tg://user?id=8724732477\">@Admin</a>"
+    )
+    keyboard = [
+        [InlineKeyboardButton(text="💬 Написать создателю", url="tg://user?id=8724732477")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="btn_menu")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data == "btn_quick_search")
+async def callback_quick_search(callback: CallbackQuery, bot: Bot):
+    """Быстрый поиск доступных 5-буквенных читаемых ников"""
+    user = get_user_db(callback.from_user.id)
+    user_vip = is_vip(user)
+    
+    if not user_vip and user["daily_searches"] >= FREE_DAILY_LIMIT:
+        await callback.answer("❌ Дневной лимит бесплатных поисков исчерпан!", show_alert=True)
+        return
+
+    await callback.answer("🔎 Сканируем Telegram на читаемые 5-буквенники...", show_alert=False)
+    await callback.message.edit_text("⏳ <i>Подбираем читаемые комбинации и проверяем доступность... Пожалуйста, подождите.</i>", parse_mode=ParseMode.HTML)
+
+    found_available = []
+    attempts = 0
+    max_attempts = 15
+
+    async with aiohttp.ClientSession() as session:
+        while len(found_available) < 3 and attempts < max_attempts:
+            attempts += 1
+            candidate = generate_readable_5letter()
+            is_free = await check_telegram_username_available(session, candidate)
+            if is_free:
+                found_available.append(candidate)
+            await asyncio.sleep(0.3)
+
+    increment_search_count(callback.from_user.id)
+    
+    if found_available:
+        results_list = "\n".join([f"✨ <code>@{u}</code> — <b>Свободен!</b> (<a href='https://t.me/{u}'>Открыть</a>)" for u in found_available])
+        text = (
+            f"🎉 <b>Результаты сканирования Swithub:</b>\n\n"
+            f"{results_list}\n\n"
+            f"<i>Успейте занять юзернейм в настройках профиля или канала!</i>"
+        )
+    else:
+        text = "😕 В этой пачке все сгенерированные имена заняты. Попробуйте еще раз!"
+
+    keyboard = [
+        [InlineKeyboardButton(text="🔄 Искать еще раз", callback_data="btn_quick_search")],
+        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="btn_menu")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+@router.callback_query(F.data == "btn_mask_search")
+async def callback_mask_search(callback: CallbackQuery, state: FSMContext):
+    """Поиск по маске (только для VIP)"""
+    user = get_user_db(callback.from_user.id)
+    if not is_vip(user):
+        await callback.answer("🔒 Данная функция доступна только для пользователей с VIP статусом!", show_alert=True)
+        return
+
+    await state.set_state(SearchStates.waiting_for_mask)
+    text = (
+        "🎯 <b>Поиск по маске (5 символов):</b>\n\n"
+        "Отправьте маску в чат, используя <code>?</code> для неизвестных букв.\n\n"
+        "<b>Примеры:</b>\n"
+        "• <code>s?a?r</code> — первая 's', третья 'a', пятая 'r'\n"
+        "• <code>?a?e?</code> — гласные на чётных позициях\n"
+        "• <code>b?o??</code> — начинается на 'bo'\n\n"
+        "<i>Отправьте ровно 5 символов сообщением:</i>"
+    )
+    keyboard = [[InlineKeyboardButton(text="❌ Отмена", callback_data="btn_menu")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.message(StateFilter(SearchStates.waiting_for_mask))
+async def handle_mask_input(message: Message, state: FSMContext):
+    """Обработка ввода маски"""
+    mask = message.text.strip().lower()
+    if len(mask) != 5:
+        await message.answer("⚠️ Маска должна состоять <b>ровно из 5 символов</b> (буквы латиницы или знак ?).\nПопробуйте снова:")
+        return
+
+    await state.clear()
+    msg = await message.answer("🔍 <i>Генерируем имена по вашей маске и проверяем...</i>", parse_mode=ParseMode.HTML)
+
+    found_available = []
+    async with aiohttp.ClientSession() as session:
+        for _ in range(12):
+            candidate = generate_by_mask(mask)
+            if candidate:
+                is_free = await check_telegram_username_available(session, candidate)
+                if is_free and candidate not in found_available:
+                    found_available.append(candidate)
+            await asyncio.sleep(0.3)
+
+    if found_available:
+        results = "\n".join([f"💎 <code>@{u}</code> — <b>Свободен!</b>" for u in found_available])
+        text = (
+            f"🎯 <b>Найдены имена по маске <code>{mask}</code>:</b>\n\n"
+            f"{results}\n\n"
+            f"Заберите их быстрее, пока не заняли!"
+        )
+    else:
+        text = f"😕 По маске <code>{mask}</code> в этой итерации свободных юзернеймов не обнаружено. Попробуйте еще разок!"
+
+    keyboard = [
+        [InlineKeyboardButton(text="🎯 Искать по другой маске", callback_data="btn_mask_search")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="btn_menu")]
+    ]
+    await msg.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+
+@router.callback_query(F.data == "btn_traps")
+async def callback_traps_menu(callback: CallbackQuery):
+    """Меню ловушек на юзернеймы"""
+    user = get_user_db(callback.from_user.id)
+    if not is_vip(user):
+        await callback.answer("🔒 Ловушки доступны только пользователям с VIP-статусом!", show_alert=True)
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username FROM traps WHERE user_id = ? AND is_active = 1", (callback.from_user.id,))
+        traps = cursor.fetchall()
+
+    if traps:
+        traps_list = "\n".join([f"• <code>@{t[1]}</code> [ID ловушки: {t[0]}]" for t in traps])
+        text = f"🪤 <b>Ваши активные ловушки:</b>\n\n{traps_list}\n\n<i>Бот проверяет их в фоновом режиме и мгновенно оповестит вас, когда имя освободится!</i>"
+    else:
+        text = "🪤 <b>У вас пока нет активных ловушек.</b>\n\nДобавьте желаемый юзернейм, и как только владелец его освободит или сменит, вы получите оповещение!"
+
+    keyboard = [
+        [InlineKeyboardButton(text="➕ Поставить ловушку", callback_data="btn_add_trap")],
+        [InlineKeyboardButton(text="🗑 Удалить все ловушки", callback_data="btn_clear_traps")],
+        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="btn_menu")]
+    ]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data == "btn_add_trap")
+async def callback_add_trap_start(callback: CallbackQuery, state: FSMContext):
+    """Добавление новой ловушки"""
+    await state.set_state(SearchStates.waiting_for_trap_username)
+    text = "🎯 <b>Установка ловушки</b>\n\nВведите юзернейм (например <code>alexx</code> или <code>swift</code>), который нужно отслеживать:"
+    keyboard = [[InlineKeyboardButton(text="❌ Отмена", callback_data="btn_traps")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.message(StateFilter(SearchStates.waiting_for_trap_username))
+async def handle_trap_username_input(message: Message, state: FSMContext):
+    """Сохранение ловушки в базу данных"""
+    username = message.text.strip().lstrip("@").lower()
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]{3,31}$", username):
+        await message.answer("⚠️ Неверный формат Telegram юзернейма. Введите корректный юзернейм:")
+        return
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT INTO traps (user_id, username, created_at, is_active) VALUES (?, ?, ?, 1)",
+                     (message.from_user.id, username, int(datetime.datetime.now().timestamp())))
+        conn.commit()
+
+    await state.clear()
+    await message.answer(
+        f"✅ <b>Ловушка установлена!</b>\n\nМониторинг за <code>@{username}</code> запущен. Бот пришлёт сообщение, как только он станет свободным!",
+        reply_markup=get_main_keyboard(message.from_user.id),
+        parse_mode=ParseMode.HTML
+    )
+
+@router.callback_query(F.data == "btn_clear_traps")
+async def callback_clear_all_traps(callback: CallbackQuery):
+    """Очистка ловушек"""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE traps SET is_active = 0 WHERE user_id = ?", (callback.from_user.id,))
+        conn.commit()
+    await callback.answer("🧹 Все ловушки удалены!", show_alert=True)
+    await callback_traps_menu(callback)
+
+@router.callback_query(F.data == "btn_admin_panel")
+async def callback_admin_panel(callback: CallbackQuery):
+    """Главный экран админ-панели"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔ Доступ только для администратора!", show_alert=True)
+        return
+
+    text = "⚙️ <b>Панель администратора Swithub</b>\n\nВыберите действие для управления сервисом:"
+    await callback.message.edit_text(text, reply_markup=get_admin_keyboard(), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data == "btn_admin_stats")
+async def callback_admin_stats(callback: CallbackQuery):
+    """Статистика проекта"""
+    if callback.from_user.id != ADMIN_ID:
+        return
+    now_ts = int(datetime.datetime.now().timestamp())
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM users WHERE vip_until > ?", (now_ts,))
+        vip_users = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM traps WHERE is_active = 1")
+        active_traps = cursor.fetchone()[0]
+
+    stats_text = (
+        f"📊 <b>Статистика проекта Swithub:</b>\n\n"
+        f"👥 Всего пользователей: <b>{total_users}</b>\n"
+        f"💎 Активных VIP: <b>{vip_users}</b>\n"
+        f"🪤 Активных ловушек: <b>{active_traps}</b>\n"
+    )
+    keyboard = [[InlineKeyboardButton(text="⬅️ В админку", callback_data="btn_admin_panel")]]
+    await callback.message.edit_text(stats_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data == "btn_admin_users")
+async def callback_admin_users(callback: CallbackQuery):
+    """Список пользователей"""
+    if callback.from_user.id != ADMIN_ID:
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, username, first_name, vip_until FROM users ORDER BY created_at DESC LIMIT 15")
+        rows = cursor.fetchall()
+
+    lines = []
+    now_ts = int(datetime.datetime.now().timestamp())
+    for r in rows:
+        uid, uname, fname, vip_u = r
+        is_v = "💎" if vip_u > now_ts or uid == ADMIN_ID else "⚪"
+        uname_str = f"@{uname}" if uname else "нет юзернейма"
+        lines.append(f"{is_v} <code>{uid}</code> | {fname} ({uname_str})")
+
+    users_text = "👥 <b>Последние пользователи:</b>\n\n" + "\n".join(lines)
+    keyboard = [[InlineKeyboardButton(text="⬅️ В админку", callback_data="btn_admin_panel")]]
+    await callback.message.edit_text(users_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.callback_query(F.data == "btn_admin_add_vip")
+async def callback_admin_add_vip(callback: CallbackQuery, state: FSMContext):
+    """Выдача VIP пользователю"""
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(SearchStates.admin_grant_vip)
+    text = (
+        "➕ <b>Выдача VIP-доступа:</b>\n\n"
+        "Отправьте сообщением <b>ID пользователя</b> и <b>количество дней</b> через пробел:\n"
+        "<code>123456789 30</code>"
+    )
+    keyboard = [[InlineKeyboardButton(text="❌ Отмена", callback_data="btn_admin_panel")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.message(StateFilter(SearchStates.admin_grant_vip))
+async def handle_admin_grant_vip(message: Message, state: FSMContext, bot: Bot):
+    """Обработка выдачи VIP статуса"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        parts = message.text.strip().split()
+        target_id = int(parts[0])
+        days = int(parts[1])
+        
+        now_ts = int(datetime.datetime.now().timestamp())
+        vip_expiry = now_ts + (days * 86400)
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE users SET vip_until = ? WHERE user_id = ?", (vip_expiry, target_id))
+            conn.commit()
+
+        await state.clear()
+        await message.answer(f"✅ VIP успешно выдан пользователю <code>{target_id}</code> на {days} дн.!", reply_markup=get_admin_keyboard(), parse_mode=ParseMode.HTML)
+        
+        # Оповещаем пользователя
+        try:
+            await bot.send_message(
+                chat_id=target_id,
+                text=f"🎉 <b>Поздравляем!</b>\n\nВам активирован <b>Swithub VIP</b> на <b>{days}</b> дней!\nТеперь вам доступен безлимитный поиск, маски и ловушки.",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка формата. Введите ID и дни через пробел (например: <code>12345678 30</code>):")
+
+@router.callback_query(F.data == "btn_admin_del_vip")
+async def callback_admin_del_vip(callback: CallbackQuery, state: FSMContext):
+    """Снятие VIP статуса"""
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(SearchStates.admin_revoke_vip)
+    text = "➖ <b>Снятие VIP статуса:</b>\n\nОтправьте <b>ID пользователя</b> сообщением:"
+    keyboard = [[InlineKeyboardButton(text="❌ Отмена", callback_data="btn_admin_panel")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.message(StateFilter(SearchStates.admin_revoke_vip))
+async def handle_admin_revoke_vip(message: Message, state: FSMContext):
+    """Обработка снятия VIP"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        target_id = int(message.text.strip())
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE users SET vip_until = 0 WHERE user_id = ?", (target_id,))
+            conn.commit()
+        await state.clear()
+        await message.answer(f"✅ VIP статус снят с пользователя <code>{target_id}</code>.", reply_markup=get_admin_keyboard(), parse_mode=ParseMode.HTML)
+    except Exception:
+        await message.answer("⚠️ Неверный ID. Попробуйте еще раз:")
+
+@router.callback_query(F.data == "btn_admin_broadcast")
+async def callback_admin_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Рассылка сообщений всем пользователям"""
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(SearchStates.admin_broadcast)
+    text = "📨 <b>Рассылка:</b>\n\nОтправьте текст сообщения для рассылки всем пользователям бота:"
+    keyboard = [[InlineKeyboardButton(text="❌ Отмена", callback_data="btn_admin_panel")]]
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard), parse_mode=ParseMode.HTML)
+    await callback.answer()
+
+@router.message(StateFilter(SearchStates.admin_broadcast))
+async def handle_admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
+    """Отправка сообщения всем пользователям"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    broadcast_text = message.text
+    await state.clear()
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users")
+        users = cursor.fetchall()
+
+    success = 0
+    for u in users:
+        try:
+            await bot.send_message(chat_id=u[0], text=broadcast_text, parse_mode=ParseMode.HTML)
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            continue
+
+    await message.answer(f"✅ Рассылка завершена! Доставлено: <b>{success}</b> пользователей.", reply_markup=get_admin_keyboard(), parse_mode=ParseMode.HTML)
+
+async def background_trap_watcher(bot: Bot):
+    """Фоновый снайпер юзернеймов"""
+    while True:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, user_id, username FROM traps WHERE is_active = 1")
+                traps = cursor.fetchall()
+
+            if traps:
+                async with aiohttp.ClientSession() as session:
+                    for trap_id, user_id, uname in traps:
+                        is_free = await check_telegram_username_available(session, uname)
+                        if is_free:
+                            # Оповещаем пользователя
+                            try:
+                                alert_text = (
+                                    f"🚨 <b>ВНИМАНИЕ! ЛОВУШКА СРАБОТАЛА!</b>\n\n"
+                                    f"Юзернейм <b>@{uname}</b> только что освободился!\n"
+                                    f"👉 <a href='https://t.me/{uname}'>Перейти и занять прямо сейчас!</a>"
+                                )
+                                await bot.send_message(chat_id=user_id, text=alert_text, parse_mode=ParseMode.HTML)
+                            except Exception as e:
+                                logger.error(f"Не удалось отправить уведомление о ловушке: {e}")
+
+                            # Деактивируем ловушку
+                            with sqlite3.connect(DB_PATH) as conn_up:
+                                conn_up.execute("UPDATE traps SET is_active = 0 WHERE id = ?", (trap_id,))
+                                conn_up.commit()
+                        await asyncio.sleep(2)
+
+        except Exception as e:
+            logger.error(f"Ошибка в фоновом воркере ловушек: {e}")
+
+        # Проверка каждые 60 секунд
+        await asyncio.sleep(60)
+
+async def main():
+    """Точка запуска бота Swithub"""
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+    dp.include_router(router)
+
+    # Запуск фонового чекера ловушек
+    asyncio.create_task(background_trap_watcher(bot))
+
+    logger.info("Бот Swithub успешно запущен!")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
+
+```
